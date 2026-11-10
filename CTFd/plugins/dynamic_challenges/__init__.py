@@ -1,14 +1,15 @@
-from __future__ import division  # Use floating point for math calculations
-
-import math
-
 from flask import Blueprint
 
-from CTFd.models import Challenges, Solves, db
+from CTFd.exceptions.challenges import (
+    ChallengeCreateException,
+    ChallengeUpdateException,
+)
+from CTFd.models import Challenges, db
 from CTFd.plugins import register_plugin_assets_directory
 from CTFd.plugins.challenges import CHALLENGE_CLASSES, BaseChallenge
+from CTFd.plugins.dynamic_challenges.decay import DECAY_FUNCTIONS, logarithmic
 from CTFd.plugins.migrations import upgrade
-from CTFd.utils.modes import get_model
+from CTFd.utils.dates import parse_iso_datetime
 
 
 class DynamicChallenge(Challenges):
@@ -16,13 +17,49 @@ class DynamicChallenge(Challenges):
     id = db.Column(
         db.Integer, db.ForeignKey("challenges.id", ondelete="CASCADE"), primary_key=True
     )
-    initial = db.Column(db.Integer, default=0)
-    minimum = db.Column(db.Integer, default=0)
-    decay = db.Column(db.Integer, default=0)
+    dynamic_initial = db.Column(db.Integer, default=0)
+    dynamic_minimum = db.Column(db.Integer, default=0)
+    dynamic_decay = db.Column(db.Integer, default=0)
+    dynamic_function = db.Column(db.String(32), default="logarithmic")
+
+    @property
+    def initial(self):
+        return self.dynamic_initial
+
+    @initial.setter
+    def initial(self, initial_value):
+        self.dynamic_initial = initial_value
+
+    @property
+    def minimum(self):
+        return self.dynamic_minimum
+
+    @minimum.setter
+    def minimum(self, minimum_value):
+        self.dynamic_minimum = minimum_value
+
+    @property
+    def decay(self):
+        return self.dynamic_decay
+
+    @decay.setter
+    def decay(self, decay_value):
+        self.dynamic_decay = decay_value
+
+    @property
+    def function(self):
+        return self.dynamic_function
+
+    @function.setter
+    def function(self, function_value):
+        self.dynamic_function = function_value
 
     def __init__(self, *args, **kwargs):
         super(DynamicChallenge, self).__init__(**kwargs)
-        self.value = kwargs["initial"]
+        try:
+            self.value = kwargs["initial"]
+        except KeyError:
+            raise ChallengeCreateException("Missing initial value for challenge")
 
 
 class DynamicValueChallenge(BaseChallenge):
@@ -51,35 +88,8 @@ class DynamicValueChallenge(BaseChallenge):
 
     @classmethod
     def calculate_value(cls, challenge):
-        Model = get_model()
-
-        solve_count = (
-            Solves.query.join(Model, Solves.account_id == Model.id)
-            .filter(
-                Solves.challenge_id == challenge.id,
-                Model.hidden == False,
-                Model.banned == False,
-            )
-            .count()
-        )
-
-        # If the solve count is 0 we shouldn't manipulate the solve count to
-        # let the math update back to normal
-        if solve_count != 0:
-            # We subtract -1 to allow the first solver to get max point value
-            solve_count -= 1
-
-        # It is important that this calculation takes into account floats.
-        # Hence this file uses from __future__ import division
-        value = (
-            ((challenge.minimum - challenge.initial) / (challenge.decay ** 2))
-            * (solve_count ** 2)
-        ) + challenge.initial
-
-        value = math.ceil(value)
-
-        if value < challenge.minimum:
-            value = challenge.minimum
+        f = DECAY_FUNCTIONS.get(challenge.function, logarithmic)
+        value = f(challenge)
 
         challenge.value = value
         db.session.commit()
@@ -94,26 +104,15 @@ class DynamicValueChallenge(BaseChallenge):
         :return: Challenge object, data dictionary to be returned to the user
         """
         challenge = DynamicChallenge.query.filter_by(id=challenge.id).first()
-        data = {
-            "id": challenge.id,
-            "name": challenge.name,
-            "value": challenge.value,
-            "initial": challenge.initial,
-            "decay": challenge.decay,
-            "minimum": challenge.minimum,
-            "description": challenge.description,
-            "connection_info": challenge.connection_info,
-            "category": challenge.category,
-            "state": challenge.state,
-            "max_attempts": challenge.max_attempts,
-            "type": challenge.type,
-            "type_data": {
-                "id": cls.id,
-                "name": cls.name,
-                "templates": cls.templates,
-                "scripts": cls.scripts,
-            },
-        }
+        data = super().read(challenge)
+        data.update(
+            {
+                "initial": challenge.initial,
+                "decay": challenge.decay,
+                "minimum": challenge.minimum,
+                "function": challenge.function,
+            }
+        )
         return data
 
     @classmethod
@@ -126,12 +125,20 @@ class DynamicValueChallenge(BaseChallenge):
         :param request:
         :return:
         """
-        data = request.form or request.get_json()
+        data = dict(request.form or request.get_json() or {})
+        if "scheduled_at" in data:
+            try:
+                data["scheduled_at"] = parse_iso_datetime(data["scheduled_at"])
+            except ValueError:
+                raise ChallengeUpdateException("Invalid input for 'scheduled_at'")
 
         for attr, value in data.items():
             # We need to set these to floats so that the next operations don't operate on strings
             if attr in ("initial", "minimum", "decay"):
-                value = float(value)
+                try:
+                    value = float(value)
+                except (ValueError, TypeError):
+                    raise ChallengeUpdateException(f"Invalid input for '{attr}'")
             setattr(challenge, attr, value)
 
         return DynamicValueChallenge.calculate_value(challenge)
@@ -144,7 +151,7 @@ class DynamicValueChallenge(BaseChallenge):
 
 
 def load(app):
-    upgrade()
+    upgrade(plugin_name="dynamic_challenges")
     CHALLENGE_CLASSES["dynamic"] = DynamicValueChallenge
     register_plugin_assets_directory(
         app, base_path="/plugins/dynamic_challenges/assets/"

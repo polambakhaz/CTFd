@@ -9,7 +9,7 @@ from CTFd.api.v1.schemas import (
     APIDetailedSuccessResponse,
     PaginatedAPIListSuccessResponse,
 )
-from CTFd.cache import clear_standings, clear_user_session
+from CTFd.cache import clear_challenges, clear_standings, clear_user_session
 from CTFd.constants import RawEnum
 from CTFd.models import (
     Awards,
@@ -24,8 +24,9 @@ from CTFd.models import (
 from CTFd.schemas.awards import AwardSchema
 from CTFd.schemas.submissions import SubmissionSchema
 from CTFd.schemas.users import UserSchema
-from CTFd.utils.config import get_mail_provider
-from CTFd.utils.decorators import admins_only, authed_only, ratelimit
+from CTFd.utils.challenges import get_submissions_for_user_id_for_challenge_id
+from CTFd.utils.config import get_config, get_mail_provider
+from CTFd.utils.decorators import admins_only, authed_only, ratelimit_from_config
 from CTFd.utils.decorators.visibility import (
     check_account_visibility,
     check_score_visibility,
@@ -33,7 +34,13 @@ from CTFd.utils.decorators.visibility import (
 from CTFd.utils.email import sendmail, user_created_notification
 from CTFd.utils.helpers.models import build_model_filters
 from CTFd.utils.security.auth import update_user
-from CTFd.utils.user import get_current_user, get_current_user_type, is_admin
+from CTFd.utils.user import (
+    get_current_user,
+    get_current_user_type,
+    get_user_attrs,
+    get_user_public_api,
+    is_admin,
+)
 
 users_namespace = Namespace("users", description="Endpoint to retrieve Users")
 
@@ -87,6 +94,7 @@ class UserList(Resource):
                         "country": "country",
                         "bracket": "bracket",
                         "affiliation": "affiliation",
+                        "email": "email",
                     },
                 ),
                 None,
@@ -97,19 +105,27 @@ class UserList(Resource):
     def get(self, query_args):
         q = query_args.pop("q", None)
         field = str(query_args.pop("field", None))
+
+        if field == "email":
+            if is_admin() is False:
+                return {
+                    "success": False,
+                    "errors": {"field": "Emails can only be queried by admins"},
+                }, 400
+
         filters = build_model_filters(model=Users, query=q, field=field)
 
         if is_admin() and request.args.get("view") == "admin":
             users = (
                 Users.query.filter_by(**query_args)
                 .filter(*filters)
-                .paginate(per_page=50, max_per_page=100)
+                .paginate(per_page=50, max_per_page=100, error_out=False)
             )
         else:
             users = (
                 Users.query.filter_by(banned=False, hidden=False, **query_args)
                 .filter(*filters)
-                .paginate(per_page=50, max_per_page=100)
+                .paginate(per_page=50, max_per_page=100, error_out=False)
             )
 
         response = UserSchema(view="user", many=True).dump(users.items)
@@ -165,6 +181,7 @@ class UserList(Resource):
             user_created_notification(addr=email, name=name, password=password)
 
         clear_standings()
+        clear_challenges()
 
         response = schema.dump(response.data)
 
@@ -186,21 +203,21 @@ class UserPublic(Resource):
         },
     )
     def get(self, user_id):
-        user = Users.query.filter_by(id=user_id).first_or_404()
+        user = get_user_attrs(user_id=user_id)
+        if user is None:
+            abort(404)
 
         if (user.banned or user.hidden) and is_admin() is False:
             abort(404)
 
         user_type = get_current_user_type(fallback="user")
-        response = UserSchema(view=user_type).dump(user)
-
-        if response.errors:
-            return {"success": False, "errors": response.errors}, 400
-
-        response.data["place"] = user.place
-        response.data["score"] = user.score
-
-        return {"success": True, "data": response.data}
+        success, data, status_code = get_user_public_api(
+            user_id=user_id, user_type=user_type
+        )
+        if success:
+            return {"success": success, "data": data}, status_code
+        else:
+            return {"success": success, "errors": data}, status_code
 
     @admins_only
     @users_namespace.doc(
@@ -242,6 +259,7 @@ class UserPublic(Resource):
 
         clear_user_session(user_id=user_id)
         clear_standings()
+        clear_challenges()
 
         return {"success": True, "data": response.data}
 
@@ -270,6 +288,7 @@ class UserPublic(Resource):
 
         clear_user_session(user_id=user_id)
         clear_standings()
+        clear_challenges()
 
         return {"success": True}
 
@@ -290,8 +309,13 @@ class UserPrivate(Resource):
     def get(self):
         user = get_current_user()
         response = UserSchema("self").dump(user).data
+
+        # A user can always calculate their score regardless of any setting because they can simply sum all of their challenges
+        # Therefore a user requesting their private data should be able to get their own current score
+        # However place is not something that a user can ascertain on their own so it is always gated behind freeze time
         response["place"] = user.place
-        response["score"] = user.score
+        response["score"] = user.get_score(admin=True)
+
         return {"success": True, "data": response}
 
     @authed_only
@@ -322,8 +346,29 @@ class UserPrivate(Resource):
         db.session.close()
 
         clear_standings()
+        clear_challenges()
 
         return {"success": True, "data": response.data}
+
+
+@users_namespace.route("/me/submissions")
+class UserPrivateSubmissions(Resource):
+    @authed_only
+    def get(self):
+        # TODO: CTFd 4.0 Self viewing submissions should not be enabled by default until further notice
+        if bool(get_config("view_self_submissions")) is False:
+            abort(403)
+        user = get_current_user()
+        challenge_id = request.args.get("challenge_id")
+        response = get_submissions_for_user_id_for_challenge_id(
+            user_id=user.id, challenge_id=challenge_id
+        )
+
+        if response.errors:
+            return {"success": False, "errors": response.errors}, 400
+
+        count = len(response.data)
+        return {"success": True, "data": response.data, "meta": {"count": count}}
 
 
 @users_namespace.route("/me/solves")
@@ -339,7 +384,8 @@ class UserPrivateSolves(Resource):
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
-        return {"success": True, "data": response.data}
+        count = len(response.data)
+        return {"success": True, "data": response.data, "meta": {"count": count}}
 
 
 @users_namespace.route("/me/fails")
@@ -350,16 +396,20 @@ class UserPrivateFails(Resource):
         fails = user.get_fails(admin=True)
 
         view = "user" if not is_admin() else "admin"
-        response = SubmissionSchema(view=view, many=True).dump(fails)
-        if response.errors:
-            return {"success": False, "errors": response.errors}, 400
 
+        # We want to return the count purely for stats & graphs
+        # but this data isn't really needed by the end user.
+        # Only actually show fail data for admins.
         if is_admin():
+            response = SubmissionSchema(view=view, many=True).dump(fails)
+            if response.errors:
+                return {"success": False, "errors": response.errors}, 400
+
             data = response.data
         else:
             data = []
-        count = len(response.data)
 
+        count = len(fails)
         return {"success": True, "data": data, "meta": {"count": count}}
 
 
@@ -377,7 +427,8 @@ class UserPrivateAwards(Resource):
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
-        return {"success": True, "data": response.data}
+        count = len(response.data)
+        return {"success": True, "data": response.data, "meta": {"count": count}}
 
 
 @users_namespace.route("/<user_id>/solves")
@@ -399,7 +450,8 @@ class UserPublicSolves(Resource):
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
-        return {"success": True, "data": response.data}
+        count = len(response.data)
+        return {"success": True, "data": response.data, "meta": {"count": count}}
 
 
 @users_namespace.route("/<user_id>/fails")
@@ -415,16 +467,20 @@ class UserPublicFails(Resource):
         fails = user.get_fails(admin=is_admin())
 
         view = "user" if not is_admin() else "admin"
-        response = SubmissionSchema(view=view, many=True).dump(fails)
-        if response.errors:
-            return {"success": False, "errors": response.errors}, 400
 
+        # We want to return the count purely for stats & graphs
+        # but this data isn't really needed by the end user.
+        # Only actually show fail data for admins.
         if is_admin():
+            response = SubmissionSchema(view=view, many=True).dump(fails)
+            if response.errors:
+                return {"success": False, "errors": response.errors}, 400
+
             data = response.data
         else:
             data = []
-        count = len(response.data)
 
+        count = len(fails)
         return {"success": True, "data": data, "meta": {"count": count}}
 
 
@@ -446,7 +502,8 @@ class UserPublicAwards(Resource):
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
-        return {"success": True, "data": response.data}
+        count = len(response.data)
+        return {"success": True, "data": response.data, "meta": {"count": count}}
 
 
 @users_namespace.route("/<int:user_id>/email")
@@ -457,9 +514,10 @@ class UserEmails(Resource):
         description="Endpoint to email a User object",
         responses={200: ("Success", "APISimpleSuccessResponse")},
     )
-    @ratelimit(method="POST", limit=10, interval=60)
+    @ratelimit_from_config(method="POST", config_key="RATELIMIT_EMAIL_USER")
     def post(self, user_id):
         req = request.get_json()
+        subject = (req.get("subject") or "").strip()
         text = req.get("text", "").strip()
         user = Users.query.filter_by(id=user_id).first_or_404()
 
@@ -475,6 +533,15 @@ class UserEmails(Resource):
                 400,
             )
 
-        result, response = sendmail(addr=user.email, text=text)
+        if subject:
+            result, response = sendmail(addr=user.email, text=text, subject=subject)
+        else:
+            result, response = sendmail(addr=user.email, text=text)
 
-        return {"success": result}
+        if result is True:
+            return {"success": True}
+        else:
+            return (
+                {"success": False, "errors": {"": [response]}},
+                400,
+            )

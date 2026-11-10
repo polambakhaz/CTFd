@@ -3,6 +3,7 @@ from collections import defaultdict
 
 from flask_marshmallow import Marshmallow
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import column_property, validates
 
@@ -14,15 +15,41 @@ ma = Marshmallow()
 
 def get_class_by_tablename(tablename):
     """Return class reference mapped to table.
-    https://stackoverflow.com/a/23754464
+    https://stackoverflow.com/a/66666783
 
     :param tablename: String with name of table.
     :return: Class reference or None.
     """
-    for c in db.Model._decl_class_registry.values():
+    classes = []
+    for m in db.Model.registry.mappers:
+        c = m.class_
         if hasattr(c, "__tablename__") and c.__tablename__ == tablename:
-            return c
-    return None
+            classes.append(c)
+
+    # We didn't find this class
+    if len(classes) == 0:
+        return None
+    # This is a class where we have only one possible candidate.
+    # It's either a top level class or a polymorphic class with a specific hardcoded table name
+    elif len(classes) == 1:
+        return classes[0]
+    # In this case we are dealing with a polymorphic table where all of the tables have the same table name.
+    # However for us to identify the parent class we can look for the class that defines the polymorphic_on arg
+    else:
+        for c in classes:
+            mapper_args = dict(c.__mapper_args__)
+            if mapper_args.get("polymorphic_on") is not None:
+                return c
+
+
+@compiles(db.DateTime, "mysql")
+def compile_datetime_mysql(_type, _compiler, **kw):
+    """
+    This decorator makes the default db.DateTime class always enable fsp to enable millisecond precision
+    https://dev.mysql.com/doc/refman/5.7/en/fractional-seconds.html
+    https://docs.sqlalchemy.org/en/14/core/custom_types.html#overriding-type-compilation
+    """
+    return "DATETIME(6)"
 
 
 class Notifications(db.Model):
@@ -58,7 +85,7 @@ class Pages(db.Model):
     hidden = db.Column(db.Boolean)
     auth_required = db.Column(db.Boolean)
     format = db.Column(db.String(80), default="markdown")
-    # TODO: Use hidden attribute
+    link_target = db.Column(db.String(80), nullable=True)
 
     files = db.relationship("PageFiles", backref="page")
 
@@ -85,20 +112,36 @@ class Challenges(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(80))
     description = db.Column(db.Text)
+    attribution = db.Column(db.Text)
     connection_info = db.Column(db.Text)
+    next_id = db.Column(db.Integer, db.ForeignKey("challenges.id", ondelete="SET NULL"))
     max_attempts = db.Column(db.Integer, default=0)
     value = db.Column(db.Integer)
     category = db.Column(db.String(80))
     type = db.Column(db.String(80))
     state = db.Column(db.String(80), nullable=False, default="visible")
+    logic = db.Column(db.String(80), nullable=False, default="any")
+    initial = db.Column(db.Integer, nullable=True)
+    minimum = db.Column(db.Integer, nullable=True)
+    decay = db.Column(db.Integer, nullable=True)
+    position = db.Column(db.Integer, nullable=False, default=0)
+    function = db.Column(db.String(32), default="static")
+    scheduled_at = db.Column(db.DateTime, nullable=True)
+    module_id = db.Column(
+        db.Integer, db.ForeignKey("modules.id", ondelete="SET NULL"), nullable=True
+    )
+
     requirements = db.Column(db.JSON)
 
+    module = db.relationship("Modules", foreign_keys=[module_id], lazy="select")
     files = db.relationship("ChallengeFiles", backref="challenge")
     tags = db.relationship("Tags", backref="challenge")
     hints = db.relationship("Hints", backref="challenge")
     flags = db.relationship("Flags", backref="challenge")
     comments = db.relationship("ChallengeComments", backref="challenge")
     topics = db.relationship("ChallengeTopics", backref="challenge")
+    solution = db.relationship("Solutions", backref="challenge", uselist=False)
+    ratings = db.relationship("Ratings", backref="challenge")
 
     class alt_defaultdict(defaultdict):
         """
@@ -118,11 +161,24 @@ class Challenges(db.Model):
     }
 
     @property
+    def byline(self):
+        from CTFd.utils.config.pages import build_markdown
+        from CTFd.utils.helpers import markup
+
+        return markup(build_markdown(self.attribution))
+
+    @property
     def html(self):
         from CTFd.utils.config.pages import build_markdown
         from CTFd.utils.helpers import markup
 
         return markup(build_markdown(self.description))
+
+    @property
+    def solution_id(self):
+        if self.solution:
+            return self.solution.id
+        return None
 
     @property
     def plugin_class(self):
@@ -140,6 +196,7 @@ class Challenges(db.Model):
 class Hints(db.Model):
     __tablename__ = "hints"
     id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(80))
     type = db.Column(db.String(80), default="standard")
     challenge_id = db.Column(
         db.Integer, db.ForeignKey("challenges.id", ondelete="CASCADE")
@@ -168,6 +225,12 @@ class Hints(db.Model):
         from CTFd.utils.helpers import markup
 
         return markup(build_markdown(self.content))
+
+    @property
+    def prerequisites(self):
+        if self.requirements:
+            return self.requirements.get("prerequisites", [])
+        return []
 
     def __init__(self, *args, **kwargs):
         super(Hints, self).__init__(**kwargs)
@@ -249,11 +312,35 @@ class ChallengeTopics(db.Model):
         super(ChallengeTopics, self).__init__(**kwargs)
 
 
+class Solutions(db.Model):
+    __tablename__ = "solutions"
+    id = db.Column(db.Integer, primary_key=True)
+    challenge_id = db.Column(
+        db.Integer, db.ForeignKey("challenges.id", ondelete="CASCADE"), unique=True
+    )
+    content = db.Column(db.Text)
+    state = db.Column(db.String(80), nullable=False, default="hidden")
+
+    @property
+    def html(self):
+        from CTFd.utils.config.pages import build_markdown
+        from CTFd.utils.helpers import markup
+
+        return markup(build_markdown(self.content))
+
+    def __init__(self, *args, **kwargs):
+        super(Solutions, self).__init__(**kwargs)
+
+    def __repr__(self):
+        return "<Solution %r>" % self.id
+
+
 class Files(db.Model):
     __tablename__ = "files"
     id = db.Column(db.Integer, primary_key=True)
     type = db.Column(db.String(80), default="standard")
     location = db.Column(db.Text)
+    sha1sum = db.Column(db.String(40))
 
     __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
 
@@ -282,6 +369,13 @@ class PageFiles(Files):
 
     def __init__(self, *args, **kwargs):
         super(PageFiles, self).__init__(**kwargs)
+
+
+class SolutionFiles(Files):
+    __mapper_args__ = {"polymorphic_identity": "solution"}
+    solution_id = db.Column(
+        db.Integer, db.ForeignKey("solutions.id", ondelete="CASCADE")
+    )
 
 
 class Flags(db.Model):
@@ -320,16 +414,26 @@ class Users(db.Model):
     website = db.Column(db.String(128))
     affiliation = db.Column(db.String(128))
     country = db.Column(db.String(32))
-    bracket = db.Column(db.String(32))
+    bracket_id = db.Column(
+        db.Integer, db.ForeignKey("brackets.id", ondelete="SET NULL")
+    )
     hidden = db.Column(db.Boolean, default=False)
     banned = db.Column(db.Boolean, default=False)
     verified = db.Column(db.Boolean, default=False)
+    language = db.Column(db.String(32), nullable=True, default=None)
+    change_password = db.Column(db.Boolean, default=False)
 
     # Relationship for Teams
     team_id = db.Column(db.Integer, db.ForeignKey("teams.id"))
 
+    # Relationship for Brackets
+    bracket = db.relationship("Brackets", foreign_keys=[bracket_id], lazy="joined")
+
     field_entries = db.relationship(
-        "UserFieldEntries", foreign_keys="UserFieldEntries.user_id", lazy="joined"
+        "UserFieldEntries",
+        foreign_keys="UserFieldEntries.user_id",
+        lazy="joined",
+        back_populates="user",
     )
 
     created = db.Column(db.DateTime, default=datetime.datetime.utcnow)
@@ -383,7 +487,12 @@ class Users(db.Model):
 
     @property
     def score(self):
-        return self.get_score(admin=False)
+        from CTFd.utils.config.visibility import scores_visible
+
+        if scores_visible():
+            return self.get_score(admin=False)
+        else:
+            return None
 
     @property
     def place(self):
@@ -408,7 +517,12 @@ class Users(db.Model):
             .filter_by(user_id=self.id)
             .all()
         }
-        return required_user_fields.issubset(submitted_user_fields)
+        # Require that users select a bracket
+        missing_bracket = (
+            Brackets.query.filter_by(type="users").count()
+            and self.bracket_id is not None
+        )
+        return required_user_fields.issubset(submitted_user_fields) and missing_bracket
 
     def get_fields(self, admin=False):
         if admin:
@@ -421,7 +535,7 @@ class Users(db.Model):
     def get_solves(self, admin=False):
         from CTFd.utils import get_config
 
-        solves = Solves.query.filter_by(user_id=self.id)
+        solves = Solves.query.filter_by(user_id=self.id).order_by(Solves.date.desc())
         freeze = get_config("freeze")
         if freeze and admin is False:
             dt = datetime.datetime.utcfromtimestamp(freeze)
@@ -431,7 +545,7 @@ class Users(db.Model):
     def get_fails(self, admin=False):
         from CTFd.utils import get_config
 
-        fails = Fails.query.filter_by(user_id=self.id)
+        fails = Fails.query.filter_by(user_id=self.id).order_by(Fails.date.desc())
         freeze = get_config("freeze")
         if freeze and admin is False:
             dt = datetime.datetime.utcfromtimestamp(freeze)
@@ -441,7 +555,7 @@ class Users(db.Model):
     def get_awards(self, admin=False):
         from CTFd.utils import get_config
 
-        awards = Awards.query.filter_by(user_id=self.id)
+        awards = Awards.query.filter_by(user_id=self.id).order_by(Awards.date.desc())
         freeze = get_config("freeze")
         if freeze and admin is False:
             dt = datetime.datetime.utcfromtimestamp(freeze)
@@ -489,8 +603,8 @@ class Users(db.Model):
         to no imports within the CTFd application as importing from the
         application itself will result in a circular import.
         """
-        from CTFd.utils.scores import get_user_standings
         from CTFd.utils.humanize.numbers import ordinalize
+        from CTFd.utils.scores import get_user_standings
 
         standings = get_user_standings(admin=admin)
 
@@ -529,7 +643,9 @@ class Teams(db.Model):
     website = db.Column(db.String(128))
     affiliation = db.Column(db.String(128))
     country = db.Column(db.String(32))
-    bracket = db.Column(db.String(32))
+    bracket_id = db.Column(
+        db.Integer, db.ForeignKey("brackets.id", ondelete="SET NULL")
+    )
     hidden = db.Column(db.Boolean, default=False)
     banned = db.Column(db.Boolean, default=False)
 
@@ -537,8 +653,14 @@ class Teams(db.Model):
     captain_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"))
     captain = db.relationship("Users", foreign_keys=[captain_id])
 
+    # Relationship for Brackets
+    bracket = db.relationship("Brackets", foreign_keys=[bracket_id], lazy="joined")
+
     field_entries = db.relationship(
-        "TeamFieldEntries", foreign_keys="TeamFieldEntries.team_id", lazy="joined"
+        "TeamFieldEntries",
+        foreign_keys="TeamFieldEntries.team_id",
+        lazy="joined",
+        back_populates="team",
     )
 
     created = db.Column(db.DateTime, default=datetime.datetime.utcnow)
@@ -570,7 +692,12 @@ class Teams(db.Model):
 
     @property
     def score(self):
-        return self.get_score(admin=False)
+        from CTFd.utils.config.visibility import scores_visible
+
+        if scores_visible():
+            return self.get_score(admin=False)
+        else:
+            return None
 
     @property
     def place(self):
@@ -595,7 +722,11 @@ class Teams(db.Model):
             .filter_by(team_id=self.id)
             .all()
         }
-        return required_team_fields.issubset(submitted_team_fields)
+        missing_bracket = (
+            Brackets.query.filter_by(type="teams").count()
+            and self.bracket_id is not None
+        )
+        return required_team_fields.issubset(submitted_team_fields) and missing_bracket
 
     def get_fields(self, admin=False):
         if admin:
@@ -606,15 +737,18 @@ class Teams(db.Model):
         ]
 
     def get_invite_code(self):
-        from flask import current_app
-        from CTFd.utils.security.signing import serialize, hmac
+        from flask import current_app  # noqa: I001
+
+        from CTFd.utils.security.signing import hmac, serialize
 
         secret_key = current_app.config["SECRET_KEY"]
         if isinstance(secret_key, str):
             secret_key = secret_key.encode("utf-8")
 
-        team_password_key = self.password.encode("utf-8")
-        verification_secret = secret_key + team_password_key
+        verification_secret = secret_key
+        if self.password:
+            team_password_key = self.password.encode("utf-8")
+            verification_secret += team_password_key
 
         invite_object = {
             "id": self.id,
@@ -625,14 +759,15 @@ class Teams(db.Model):
 
     @classmethod
     def load_invite_code(cls, code):
-        from flask import current_app
-        from CTFd.utils.security.signing import (
-            unserialize,
-            hmac,
-            BadTimeSignature,
-            BadSignature,
-        )
+        from flask import current_app  # noqa: I001
+
         from CTFd.exceptions import TeamTokenExpiredException, TeamTokenInvalidException
+        from CTFd.utils.security.signing import (
+            BadSignature,
+            BadTimeSignature,
+            hmac,
+            unserialize,
+        )
 
         secret_key = current_app.config["SECRET_KEY"]
         if isinstance(secret_key, str):
@@ -652,8 +787,10 @@ class Teams(db.Model):
         team = cls.query.filter_by(id=team_id).first_or_404()
 
         # Create the team specific secret
-        team_password_key = team.password.encode("utf-8")
-        verification_secret = secret_key + team_password_key
+        verification_secret = secret_key
+        if team.password:
+            team_password_key = team.password.encode("utf-8")
+            verification_secret += team_password_key
 
         # Verify the team verficiation code
         verified = hmac(str(team.id), secret=verification_secret) == invite_object["v"]
@@ -667,7 +804,7 @@ class Teams(db.Model):
         member_ids = [member.id for member in self.members]
 
         solves = Solves.query.filter(Solves.user_id.in_(member_ids)).order_by(
-            Solves.date.asc()
+            Solves.date.desc()
         )
 
         freeze = get_config("freeze")
@@ -683,7 +820,7 @@ class Teams(db.Model):
         member_ids = [member.id for member in self.members]
 
         fails = Fails.query.filter(Fails.user_id.in_(member_ids)).order_by(
-            Fails.date.asc()
+            Fails.date.desc()
         )
 
         freeze = get_config("freeze")
@@ -699,7 +836,7 @@ class Teams(db.Model):
         member_ids = [member.id for member in self.members]
 
         awards = Awards.query.filter(Awards.user_id.in_(member_ids)).order_by(
-            Awards.date.asc()
+            Awards.date.desc()
         )
 
         freeze = get_config("freeze")
@@ -724,8 +861,8 @@ class Teams(db.Model):
         to no imports within the CTFd application as importing from the
         application itself will result in a circular import.
         """
-        from CTFd.utils.scores import get_team_standings
         from CTFd.utils.humanize.numbers import ordinalize
+        from CTFd.utils.scores import get_team_standings  # noqa: I001
 
         standings = get_team_standings(admin=admin)
 
@@ -829,11 +966,24 @@ class Fails(Submissions):
     __mapper_args__ = {"polymorphic_identity": "incorrect"}
 
 
+class Partials(Submissions):
+    __mapper_args__ = {"polymorphic_identity": "partial"}
+
+
+class Discards(Submissions):
+    __mapper_args__ = {"polymorphic_identity": "discard"}
+
+
+class Ratelimiteds(Submissions):
+    __mapper_args__ = {"polymorphic_identity": "ratelimited"}
+
+
 class Unlocks(db.Model):
     __tablename__ = "unlocks"
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
     team_id = db.Column(db.Integer, db.ForeignKey("teams.id", ondelete="CASCADE"))
+    ip = db.Column(db.String(46))
     target = db.Column(db.Integer)
     date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     type = db.Column(db.String(32))
@@ -858,11 +1008,17 @@ class HintUnlocks(Unlocks):
     __mapper_args__ = {"polymorphic_identity": "hints"}
 
 
+class SolutionUnlocks(Unlocks):
+    __mapper_args__ = {"polymorphic_identity": "solutions"}
+
+
 class Tracking(db.Model):
     __tablename__ = "tracking"
     id = db.Column(db.Integer, primary_key=True)
     type = db.Column(db.String(32))
     ip = db.Column(db.String(46))
+    user_agent = db.Column(db.String(256))
+    target = db.Column(db.Integer, nullable=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
     date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -897,6 +1053,7 @@ class Tokens(db.Model):
         db.DateTime,
         default=lambda: datetime.datetime.utcnow() + datetime.timedelta(days=30),
     )
+    description = db.Column(db.Text)
     value = db.Column(db.String(128), unique=True)
 
     user = db.relationship("Users", foreign_keys="Tokens.user_id", lazy="select")
@@ -1002,10 +1159,129 @@ class FieldEntries(db.Model):
 class UserFieldEntries(FieldEntries):
     __mapper_args__ = {"polymorphic_identity": "user"}
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
-    user = db.relationship("Users", foreign_keys="UserFieldEntries.user_id")
+    user = db.relationship(
+        "Users", foreign_keys="UserFieldEntries.user_id", back_populates="field_entries"
+    )
 
 
 class TeamFieldEntries(FieldEntries):
     __mapper_args__ = {"polymorphic_identity": "team"}
     team_id = db.Column(db.Integer, db.ForeignKey("teams.id", ondelete="CASCADE"))
-    team = db.relationship("Teams", foreign_keys="TeamFieldEntries.team_id")
+    team = db.relationship(
+        "Teams", foreign_keys="TeamFieldEntries.team_id", back_populates="field_entries"
+    )
+
+
+class Brackets(db.Model):
+    __tablename__ = "brackets"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    description = db.Column(db.Text)
+    type = db.Column(db.String(80))
+
+
+class Audiences(db.Model):
+    __tablename__ = "audiences"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    description = db.Column(db.Text)
+    # Discriminator reserved so a future v2 can fold brackets into audiences
+    # (e.g. type="bracket") without a schema migration.
+    type = db.Column(db.String(80), nullable=False, default="standard")
+
+    __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+
+    def __init__(self, *args, **kwargs):
+        super(Audiences, self).__init__(**kwargs)
+
+    def __repr__(self):
+        return "<Audience %r>" % self.name
+
+
+class AudienceMembers(db.Model):
+    __tablename__ = "audience_members"
+    id = db.Column(db.Integer, primary_key=True)
+    audience_id = db.Column(
+        db.Integer, db.ForeignKey("audiences.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=True
+    )
+    team_id = db.Column(
+        db.Integer, db.ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+
+    audience = db.relationship("Audiences", foreign_keys=[audience_id], lazy="select")
+    user = db.relationship("Users", foreign_keys=[user_id], lazy="select")
+    team = db.relationship("Teams", foreign_keys=[team_id], lazy="select")
+
+    @hybrid_property
+    def account_id(self):
+        from CTFd.utils import get_config
+
+        user_mode = get_config("user_mode")
+        if user_mode == "teams":
+            return self.team_id
+        elif user_mode == "users":
+            return self.user_id
+
+    __table_args__ = (
+        db.UniqueConstraint("audience_id", "user_id", name="uq_audience_user"),
+        db.UniqueConstraint("audience_id", "team_id", name="uq_audience_team"),
+    )
+
+
+class Modules(db.Model):
+    __tablename__ = "modules"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    description = db.Column(db.Text)
+
+    def __init__(self, *args, **kwargs):
+        super(Modules, self).__init__(**kwargs)
+
+    def __repr__(self):
+        return "<Module %r>" % self.name
+
+
+class ModuleAudienceAccess(db.Model):
+    __tablename__ = "module_audience_access"
+    id = db.Column(db.Integer, primary_key=True)
+    module_id = db.Column(
+        db.Integer, db.ForeignKey("modules.id", ondelete="CASCADE"), nullable=False
+    )
+    audience_id = db.Column(
+        db.Integer, db.ForeignKey("audiences.id", ondelete="CASCADE"), nullable=False
+    )
+
+    module = db.relationship("Modules", foreign_keys=[module_id], lazy="select")
+    audience = db.relationship("Audiences", foreign_keys=[audience_id], lazy="select")
+
+    __table_args__ = (
+        db.UniqueConstraint("module_id", "audience_id", name="uq_module_audience"),
+    )
+
+
+class Ratings(db.Model):
+    __tablename__ = "ratings"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
+    challenge_id = db.Column(
+        db.Integer, db.ForeignKey("challenges.id", ondelete="CASCADE")
+    )
+    value = db.Column(db.Integer)
+    review = db.Column(db.String(2000), nullable=True)
+    date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+    user = db.relationship("Users", foreign_keys="Ratings.user_id", lazy="select")
+
+    # Ensure one rating per user per challenge
+    __table_args__ = (db.UniqueConstraint("user_id", "challenge_id"),)
+
+    def __init__(self, *args, **kwargs):
+        super(Ratings, self).__init__(**kwargs)
+
+    def __repr__(self):
+        return "<Rating user_id={} challenge_id={} value={}>".format(
+            self.user_id, self.challenge_id, self.value
+        )

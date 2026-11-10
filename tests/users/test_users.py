@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from CTFd.models import Users
+from CTFd.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,
@@ -61,6 +62,10 @@ def test_hidden_user_visibility():
 
             r = client.get("/users")
             response = r.get_data(as_text=True)
+            # Only search in body content
+            body_start = response.find("<body>")
+            body_end = response.find("</body>")
+            response = response[body_start:body_end]
             assert user_name not in response
 
             r = client.get("/api/v1/users")
@@ -71,6 +76,10 @@ def test_hidden_user_visibility():
 
             r = client.get("/scoreboard")
             response = r.get_data(as_text=True)
+            # Only search in body content
+            body_start = response.find("<body>")
+            body_end = response.find("</body>")
+            response = response[body_start:body_end]
             assert user_name not in response
 
             r = client.get("/api/v1/scoreboard")
@@ -85,6 +94,10 @@ def test_hidden_user_visibility():
 
             r = client.get("/users")
             response = r.get_data(as_text=True)
+            # Only search in body content
+            body_start = response.find("<body>")
+            body_end = response.find("</body>")
+            response = response[body_start:body_end]
             assert user_name in response
 
             r = client.get("/api/v1/users")
@@ -94,4 +107,68 @@ def test_hidden_user_visibility():
             r = client.get("/api/v1/scoreboard")
             response = r.get_data(as_text=True)
             assert user_name in response
+    destroy_ctfd(app)
+
+
+def test_num_users_limit():
+    """Only num_users users can be created"""
+    app = create_ctfd()
+    with app.app_context():
+        set_config("num_users", 1)
+
+        register_user(app)
+        with app.test_client() as client:
+            r = client.get("/register")
+            assert r.status_code == 403
+
+            # team should be blocked from creation
+            with client.session_transaction() as sess:
+                data = {
+                    "name": "user",
+                    "email": "user@examplectf.com",
+                    "password": "password",
+                    "nonce": sess.get("nonce"),
+                }
+            r = client.post("/register", data=data)
+            resp = r.get_data(as_text=True)
+            # This number is 2 to account for the admin and the registered user
+            assert Users.query.count() == 2
+            assert "Reached the maximum number of users" in resp
+
+            # Can the team be created after the num has been bumped
+            set_config("num_users", 2)
+            with client.session_transaction() as sess:
+                data = {
+                    "name": "user1",
+                    "email": "user1@examplectf.com",
+                    "password": "password",
+                    "nonce": sess.get("nonce"),
+                }
+            r = client.post("/register", data=data)
+            resp = r.get_data(as_text=True)
+            assert r.status_code == 302
+            assert Users.query.count() == 3
+    destroy_ctfd(app)
+
+
+def test_api_users_post_admin_duplicate_admin_name():
+    """Creating a user with a name matching the calling admin's returns 400, not 500"""
+    app = create_ctfd()
+    with app.app_context():
+        admin = Users.query.filter_by(id=1).first()
+        admin_name = admin.name
+        with login_as_user(app, "admin") as client:
+            r = client.post(
+                "/api/v1/users",
+                json={
+                    "name": admin_name,
+                    "email": "admin2@examplectf.com",
+                    "password": "password",
+                },
+            )
+            assert r.status_code == 400
+            resp = r.get_json()
+            assert resp["success"] is False
+            assert resp["errors"]
+            assert Users.query.count() == 1
     destroy_ctfd(app)

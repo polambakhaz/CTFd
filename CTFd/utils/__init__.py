@@ -1,10 +1,13 @@
+import json
 from enum import Enum
 
 import cmarkgfm
+from cmarkgfm.cmark import Options
 from flask import current_app as app
 
 # isort:imports-firstparty
 from CTFd.cache import cache
+from CTFd.constants.setup import DEFAULTS
 from CTFd.models import Configs, db
 
 string_types = (str,)
@@ -14,13 +17,28 @@ binary_type = bytes
 
 def markdown(md):
     return cmarkgfm.markdown_to_html_with_extensions(
-        md, extensions=["autolink", "table", "strikethrough"]
+        md,
+        extensions=["autolink", "table", "strikethrough"],
+        options=Options.CMARK_OPT_UNSAFE,
     )
 
 
 def get_app_config(key, default=None):
     value = app.config.get(key, default)
     return value
+
+
+@cache.memoize()
+def _get_asset_json(path):
+    with open(path) as f:
+        return json.loads(f.read())
+
+
+def get_asset_json(path):
+    # Ignore caching if we are in debug mode
+    if app.debug:
+        return _get_asset_json.__wrapped__(path)
+    return _get_asset_json(path)
 
 
 @cache.memoize()
@@ -45,12 +63,20 @@ def _get_config(key):
 
 
 def get_config(key, default=None):
+    # Look up the config in the local PRESET_CONFIGS store first
+    preset_configs = app.config.get("PRESET_CONFIGS")
+    if preset_configs and key in app.config.get("PRESET_CONFIGS"):
+        return app.config["PRESET_CONFIGS"][key]
+
     # Convert enums to raw string values to cache better
     if isinstance(key, Enum):
         key = str(key)
 
     value = _get_config(key)
     if value is KeyError:
+        # These defaults are used in situations where setup was skipped or partially completed
+        if default is None and key in DEFAULTS:
+            return DEFAULTS.get(key)
         return default
     else:
         return value
@@ -71,3 +97,14 @@ def set_config(key, value):
 
     cache.delete_memoized(_get_config, key)
     return config
+
+
+def import_in_progress():
+    import_status = cache.get(key="import_status")
+    import_error = cache.get(key="import_error")
+    if import_error:
+        return False
+    elif import_status:
+        return True
+    else:
+        return False

@@ -2,6 +2,7 @@
 Script for checking that a database server is available.
 Essentially a cross-platform, database agnostic mysqladmin.
 """
+
 import time
 
 from sqlalchemy import create_engine
@@ -17,18 +18,19 @@ if url.drivername.startswith("sqlite"):
 
 # Null out the database so raw_connection doesnt error if it doesnt exist
 # CTFd will create the database if it doesnt exist
-url.database = None
+url = url._replace(database=None)
 
 # Wait for the database server to be available
 engine = create_engine(url)
-print(f"Waiting for {url} to be ready")
+print(f"Waiting for {url.host} to be ready")
 while True:
     try:
         engine.raw_connection()
         break
-    except Exception:
-        print(".", end="", flush=True)
+    except Exception as e:
+        print(e)
+        print("Waiting 1s for database connection")
         time.sleep(1)
 
-print(f"{url} is ready")
+print(f"{url.host} is ready")
 time.sleep(1)

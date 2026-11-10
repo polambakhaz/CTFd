@@ -3,13 +3,13 @@ from marshmallow.fields import Nested
 from marshmallow_sqlalchemy import field_for
 from sqlalchemy.orm import load_only
 
-from CTFd.models import UserFieldEntries, UserFields, Users, ma
+from CTFd.models import Brackets, UserFieldEntries, UserFields, Users, ma
 from CTFd.schemas.fields import UserFieldEntriesSchema
 from CTFd.utils import get_config, string_types
 from CTFd.utils.crypto import verify_password
-from CTFd.utils.email import check_email_is_whitelisted
+from CTFd.utils.email import check_email_is_blacklisted, check_email_is_whitelisted
 from CTFd.utils.user import get_current_user, is_admin
-from CTFd.utils.validators import validate_country_code
+from CTFd.utils.validators import validate_country_code, validate_language
 
 
 class UserSchema(ma.ModelSchema):
@@ -42,16 +42,20 @@ class UserSchema(ma.ModelSchema):
         "website",
         validate=[
             # This is a dirty hack to let website accept empty strings so you can remove your website
-            lambda website: validate.URL(
-                error="Websites must be a proper URL starting with http or https",
-                schemes={"http", "https"},
-            )(website)
-            if website
-            else True
+            lambda website: (
+                validate.URL(
+                    error="Websites must be a proper URL starting with http or https",
+                    schemes={"http", "https"},
+                )(website)
+                if website
+                else True
+            )
         ],
     )
+    language = field_for(Users, "language", validate=[validate_language])
     country = field_for(Users, "country", validate=[validate_country_code])
     password = field_for(Users, "password", required=True, allow_none=False)
+    bracket_id = field_for(Users, "bracket_id")
     fields = Nested(
         UserFieldEntriesSchema, partial=True, many=True, attribute="field_entries"
     )
@@ -66,7 +70,10 @@ class UserSchema(ma.ModelSchema):
         existing_user = Users.query.filter_by(name=name).first()
         current_user = get_current_user()
         if is_admin():
+            # Set to the user_id we are targetting or the instance id for self updates
             user_id = data.get("id")
+            if user_id is None and self.instance:
+                user_id = self.instance.id
             if user_id:
                 if existing_user and existing_user.id != user_id:
                     raise ValidationError(
@@ -74,15 +81,9 @@ class UserSchema(ma.ModelSchema):
                     )
             else:
                 if existing_user:
-                    if current_user:
-                        if current_user.id != existing_user.id:
-                            raise ValidationError(
-                                "User name has already been taken", field_names=["name"]
-                            )
-                    else:
-                        raise ValidationError(
-                            "User name has already been taken", field_names=["name"]
-                        )
+                    raise ValidationError(
+                        "User name has already been taken", field_names=["name"]
+                    )
         else:
             if name == current_user.name:
                 return data
@@ -107,7 +108,10 @@ class UserSchema(ma.ModelSchema):
         existing_user = Users.query.filter_by(email=email).first()
         current_user = get_current_user()
         if is_admin():
+            # Set to the user_id we are targetting or the instance id for self updates
             user_id = data.get("id")
+            if user_id is None and self.instance:
+                user_id = self.instance.id
             if user_id:
                 if existing_user and existing_user.id != user_id:
                     raise ValidationError(
@@ -115,16 +119,9 @@ class UserSchema(ma.ModelSchema):
                     )
             else:
                 if existing_user:
-                    if current_user:
-                        if current_user.id != existing_user.id:
-                            raise ValidationError(
-                                "Email address has already been used",
-                                field_names=["email"],
-                            )
-                    else:
-                        raise ValidationError(
-                            "Email address has already been used", field_names=["email"]
-                        )
+                    raise ValidationError(
+                        "Email address has already been used", field_names=["email"]
+                    )
         else:
             if email == current_user.email:
                 return data
@@ -150,9 +147,12 @@ class UserSchema(ma.ModelSchema):
                     )
                 if check_email_is_whitelisted(email) is False:
                     raise ValidationError(
-                        "Only email addresses under {domains} may register".format(
-                            domains=get_config("domain_whitelist")
-                        ),
+                        "Email address is not from an allowed domain",
+                        field_names=["email"],
+                    )
+                if check_email_is_blacklisted(email) is True:
+                    raise ValidationError(
+                        "Email address is not from an allowed domain",
                         field_names=["email"],
                     )
                 if get_config("verify_emails"):
@@ -167,12 +167,23 @@ class UserSchema(ma.ModelSchema):
         if is_admin():
             pass
         else:
+            # If the user has no password set, allow them to set their password
+            if target_user.password is None:
+                return
+
             if password and (bool(confirm) is False):
                 raise ValidationError(
                     "Please confirm your current password", field_names=["confirm"]
                 )
 
             if password and confirm:
+                password_min_length = int(get_config("password_min_length", default=0))
+                if len(password) < password_min_length:
+                    raise ValidationError(
+                        f"Password must be at least {password_min_length} characters",
+                        field_names=["password"],
+                    )
+
                 test = verify_password(
                     plaintext=confirm, ciphertext=target_user.password
                 )
@@ -185,6 +196,40 @@ class UserSchema(ma.ModelSchema):
             else:
                 data.pop("password", None)
                 data.pop("confirm", None)
+
+    @pre_load
+    def validate_bracket_id(self, data):
+        bracket_id = data.get("bracket_id")
+        if bracket_id is None:
+            return
+
+        if is_admin():
+            bracket = Brackets.query.filter_by(id=bracket_id, type="users").first()
+            if bracket is None:
+                raise ValidationError(
+                    "Please provide a valid bracket id", field_names=["bracket_id"]
+                )
+        else:
+            current_user = get_current_user()
+            # Users are not allowed to switch their bracket
+            if bracket_id is None:
+                # Remove bracket_id and short circuit processing
+                data.pop("bracket_id", None)
+                return
+            if (
+                current_user.bracket_id == int(bracket_id)
+                or current_user.bracket_id is None
+            ):
+                bracket = Brackets.query.filter_by(id=bracket_id, type="users").first()
+                if bracket is None:
+                    raise ValidationError(
+                        "Please provide a valid bracket id", field_names=["bracket_id"]
+                    )
+            else:
+                raise ValidationError(
+                    "Please contact an admin to change your bracket",
+                    field_names=["bracket_id"],
+                )
 
     @pre_load
     def validate_fields(self, data):
@@ -250,10 +295,13 @@ class UserSchema(ma.ModelSchema):
                     field_id=field.id, user_id=current_user.id
                 ).first()
 
-                if field.required is True and value.strip() == "":
-                    raise ValidationError(
-                        f"Field '{field.name}' is required", field_names=["fields"]
-                    )
+                if field.required is True:
+                    if isinstance(value, str):
+                        if value.strip() == "":
+                            raise ValidationError(
+                                f"Field '{field.name}' is required",
+                                field_names=["fields"],
+                            )
 
                 if field.editable is False and entry is not None:
                     raise ValidationError(
@@ -290,6 +338,14 @@ class UserSchema(ma.ModelSchema):
         removed_field_ids = []
         fields = UserFields.query.all()
 
+        if isinstance(self.view, string_types) is False or self.view not in self.views:
+            # TODO: CTFd 4.0 Passing a list of fields to UserSchema as the view will be removed
+            # TODO: CTFd 3.9 or higher this should throw an exception instead of soft deprecation
+            print(
+                "CTFd 4.0 To access custom fields while passing a view list create a custom UserSchema subclass"
+            )
+            data.pop("fields", None)
+
         # Select fields for removal based on current view and properties of the field
         for field in fields:
             if self.view == "user":
@@ -312,7 +368,7 @@ class UserSchema(ma.ModelSchema):
             "name",
             "country",
             "affiliation",
-            "bracket",
+            "bracket_id",
             "id",
             "oauth_id",
             "fields",
@@ -322,9 +378,10 @@ class UserSchema(ma.ModelSchema):
             "website",
             "name",
             "email",
+            "language",
             "country",
             "affiliation",
-            "bracket",
+            "bracket_id",
             "id",
             "oauth_id",
             "password",
@@ -338,15 +395,17 @@ class UserSchema(ma.ModelSchema):
             "country",
             "banned",
             "email",
+            "language",
             "affiliation",
             "secret",
-            "bracket",
+            "bracket_id",
             "hidden",
             "id",
             "oauth_id",
             "password",
             "type",
             "verified",
+            "change_password",
             "fields",
             "team_id",
         ],
@@ -357,6 +416,10 @@ class UserSchema(ma.ModelSchema):
             if isinstance(view, string_types):
                 kwargs["only"] = self.views[view]
             elif isinstance(view, list):
+                # TODO: CTFd 4.0 Passing a list of fields to UserSchema as the view will be removed
+                print(
+                    "Passing a list of fields to UserSchema will be removed in CTFd 4.0. Please pass a view name instead."
+                )
                 kwargs["only"] = view
         self.view = view
 

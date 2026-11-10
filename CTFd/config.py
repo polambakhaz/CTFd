@@ -1,7 +1,12 @@
 import configparser
+import json
 import os
 from distutils.util import strtobool
 from typing import Union
+
+from sqlalchemy.engine.url import URL
+
+_FORCED_EXTRA_CONFIG_TYPES = {}
 
 
 class EnvInterpolation(configparser.BasicInterpolation):
@@ -11,12 +16,23 @@ class EnvInterpolation(configparser.BasicInterpolation):
         value = super().before_get(parser, section, option, value, defaults)
         envvar = os.getenv(option)
         if value == "" and envvar:
-            return process_string_var(envvar)
+            return process_string_var(envvar, key=option)
         else:
             return value
 
 
-def process_string_var(value):
+def process_string_var(value, key=None):
+    if key in _FORCED_EXTRA_CONFIG_TYPES:
+        t = _FORCED_EXTRA_CONFIG_TYPES[key]
+        if t == "str":
+            return str(value)
+        elif t == "int":
+            return int(value)
+        elif t == "float":
+            return float(value)
+        elif t == "bool":
+            return bool(strtobool(value))
+
     if value == "":
         return None
 
@@ -48,6 +64,13 @@ def empty_str_cast(value, default=None):
     if value == "":
         return default
     return value
+
+
+def int_tuple_cast(value, num_ints=None):
+    ints = tuple(int(v) for v in str(value).split(","))
+    if num_ints is not None and len(ints) != num_ints:
+        raise ValueError(f"Expected {num_ints} integers, got {len(ints)}: {value}")
+    return ints
 
 
 def gen_secret_key():
@@ -83,13 +106,43 @@ class ServerConfig(object):
     SECRET_KEY: str = empty_str_cast(config_ini["server"]["SECRET_KEY"]) \
         or gen_secret_key()
 
-    DATABASE_URL: str = empty_str_cast(config_ini["server"]["DATABASE_URL"]) \
-        or f"sqlite:///{os.path.dirname(os.path.abspath(__file__))}/ctfd.db"
+    DATABASE_URL: str = empty_str_cast(config_ini["server"]["DATABASE_URL"])
+    if not DATABASE_URL:
+        if empty_str_cast(config_ini["server"]["DATABASE_HOST"]) is not None:
+            # construct URL from individual variables
+            DATABASE_URL = str(URL(
+                drivername=empty_str_cast(config_ini["server"]["DATABASE_PROTOCOL"]) or "mysql+pymysql",
+                username=empty_str_cast(config_ini["server"]["DATABASE_USER"]) or "ctfd",
+                password=empty_str_cast(config_ini["server"]["DATABASE_PASSWORD"]),
+                host=empty_str_cast(config_ini["server"]["DATABASE_HOST"]),
+                port=empty_str_cast(config_ini["server"]["DATABASE_PORT"]),
+                database=empty_str_cast(config_ini["server"]["DATABASE_NAME"]) or "ctfd",
+            ))
+        else:
+            # default to local SQLite DB
+            DATABASE_URL = f"sqlite:///{os.path.dirname(os.path.abspath(__file__))}/ctfd.db"
 
     REDIS_URL: str = empty_str_cast(config_ini["server"]["REDIS_URL"])
 
+    REDIS_HOST: str = empty_str_cast(config_ini["server"]["REDIS_HOST"])
+    REDIS_PROTOCOL: str = empty_str_cast(config_ini["server"]["REDIS_PROTOCOL"]) or "redis"
+    REDIS_USER: str = empty_str_cast(config_ini["server"]["REDIS_USER"])
+    REDIS_PASSWORD: str = empty_str_cast(config_ini["server"]["REDIS_PASSWORD"])
+    REDIS_PORT: int = empty_str_cast(config_ini["server"]["REDIS_PORT"]) or 6379
+    REDIS_DB: int = empty_str_cast(config_ini["server"]["REDIS_DB"]) or 0
+
+    if REDIS_URL or REDIS_HOST is None:
+        CACHE_REDIS_URL = REDIS_URL
+    else:
+        # construct URL from individual variables
+        CACHE_REDIS_URL = f"{REDIS_PROTOCOL}://"
+        if REDIS_USER:
+            CACHE_REDIS_URL += REDIS_USER
+        if REDIS_PASSWORD:
+            CACHE_REDIS_URL += f":{REDIS_PASSWORD}"
+        CACHE_REDIS_URL += f"@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+
     SQLALCHEMY_DATABASE_URI = DATABASE_URL
-    CACHE_REDIS_URL = REDIS_URL
     if CACHE_REDIS_URL:
         CACHE_TYPE: str = "redis"
     else:
@@ -108,6 +161,15 @@ class ServerConfig(object):
 
     PERMANENT_SESSION_LIFETIME: int = config_ini["security"].getint("PERMANENT_SESSION_LIFETIME") \
         or 604800
+
+    CROSS_ORIGIN_OPENER_POLICY: str = empty_str_cast(config_ini["security"].get("CROSS_ORIGIN_OPENER_POLICY")) \
+        or "same-origin-allow-popups"
+
+    TRUSTED_HOSTS: list[str] | None = None
+    if config_ini["security"].get("TRUSTED_HOSTS"):
+        TRUSTED_HOSTS = [
+            h.strip() for h in empty_str_cast(config_ini["security"].get("TRUSTED_HOSTS")).split(",")
+        ]
 
     """
     TRUSTED_PROXIES:
@@ -129,6 +191,29 @@ class ServerConfig(object):
         r"^172\.(1[6-9]|2[0-9]|3[0-1])\.",
         r"^192\.168\.",
     ]
+
+    # === RATELIMIT ===
+    RATELIMIT_DISABLE: bool = process_boolean_str(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_DISABLE"), default=False))
+
+    RATELIMIT_DEFAULT: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_DEFAULT")) or "50,300", num_ints=2)
+
+    RATELIMIT_CONFIRM: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_CONFIRM")) or "10,60", num_ints=2)
+
+    RATELIMIT_RESET_PASSWORD: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_RESET_PASSWORD")) or "10,60", num_ints=2)
+
+    RATELIMIT_REGISTER: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_REGISTER")) or "10,5", num_ints=2)
+
+    RATELIMIT_LOGIN: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_LOGIN")) or "10,5", num_ints=2)
+
+    RATELIMIT_OAUTH_REDIRECT: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_OAUTH_REDIRECT")) or "10,60", num_ints=2)
+
+    RATELIMIT_JOIN_TEAM: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_JOIN_TEAM")) or "10,5", num_ints=2)
+
+    RATELIMIT_EXPORT: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_EXPORT")) or "10,60", num_ints=2)
+
+    RATELIMIT_EMAIL_USER: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_EMAIL_USER")) or "10,60", num_ints=2)
+
+    RATELIMIT_EVENTS: tuple = int_tuple_cast(empty_str_cast(config_ini["ratelimits"].get("RATELIMIT_EVENTS")) or "150,60", num_ints=2)
 
     # === EMAIL ===
     MAILFROM_ADDR: str = config_ini["email"]["MAILFROM_ADDR"] \
@@ -152,7 +237,9 @@ class ServerConfig(object):
 
     MAILGUN_API_KEY: str = empty_str_cast(config_ini["email"]["MAILGUN_API_KEY"])
 
-    MAILGUN_BASE_URL: str = empty_str_cast(config_ini["email"]["MAILGUN_API_KEY"])
+    MAILGUN_BASE_URL: str = empty_str_cast(config_ini["email"]["MAILGUN_BASE_URL"])
+
+    MAIL_PROVIDER: str = empty_str_cast(config_ini["email"].get("MAIL_PROVIDER"))
 
     # === LOGS ===
     LOG_FOLDER: str = empty_str_cast(config_ini["logs"]["LOG_FOLDER"]) \
@@ -174,6 +261,14 @@ class ServerConfig(object):
 
         AWS_S3_ENDPOINT_URL: str = empty_str_cast(config_ini["uploads"]["AWS_S3_ENDPOINT_URL"])
 
+        AWS_S3_REGION: str = empty_str_cast(config_ini["uploads"]["AWS_S3_REGION"])
+
+        AWS_S3_CUSTOM_DOMAIN: str = empty_str_cast(config_ini["uploads"].get("AWS_S3_CUSTOM_DOMAIN", ""))
+
+        AWS_S3_CUSTOM_PREFIX: str = empty_str_cast(config_ini["uploads"].get("AWS_S3_CUSTOM_PREFIX", ""))
+
+        AWS_S3_ADDRESSING_STYLE: str = empty_str_cast(config_ini["uploads"].get("AWS_S3_ADDRESSING_STYLE", ""), default="auto")
+
     # === OPTIONAL ===
     REVERSE_PROXY: Union[str, bool] = empty_str_cast(config_ini["optional"]["REVERSE_PROXY"], default=False)
 
@@ -191,9 +286,22 @@ class ServerConfig(object):
 
     APPLICATION_ROOT: str = empty_str_cast(config_ini["optional"]["APPLICATION_ROOT"], default="/")
 
+    RUN_ID: str = empty_str_cast(config_ini["optional"].get("RUN_ID"), default=None)
+
     SERVER_SENT_EVENTS: bool = process_boolean_str(empty_str_cast(config_ini["optional"]["SERVER_SENT_EVENTS"], default=True))
 
     HTML_SANITIZATION: bool = process_boolean_str(empty_str_cast(config_ini["optional"]["HTML_SANITIZATION"], default=False))
+
+    SAFE_MODE: bool = process_boolean_str(empty_str_cast(config_ini["optional"].get("SAFE_MODE", False), default=False))
+
+    EMAIL_CONFIRMATION_REQUIRE_INTERACTION: bool = process_boolean_str(empty_str_cast(config_ini["optional"].get("EMAIL_CONFIRMATION_REQUIRE_INTERACTION", False), default=False))
+
+    EXTRA_CONFIGS_FORCE_TYPES: str = empty_str_cast(config_ini["optional"].get("EXTRA_CONFIGS_FORCE_TYPES"), default=None)
+    if EXTRA_CONFIGS_FORCE_TYPES:
+        config_types = EXTRA_CONFIGS_FORCE_TYPES.split(",")
+        for entry in config_types:
+            k, v = entry.split("=")
+            _FORCED_EXTRA_CONFIG_TYPES[k] = v
 
     if DATABASE_URL.startswith("sqlite") is False:
         SQLALCHEMY_ENGINE_OPTIONS = {
@@ -204,6 +312,31 @@ class ServerConfig(object):
     # === OAUTH ===
     OAUTH_CLIENT_ID: str = empty_str_cast(config_ini["oauth"]["OAUTH_CLIENT_ID"])
     OAUTH_CLIENT_SECRET: str = empty_str_cast(config_ini["oauth"]["OAUTH_CLIENT_SECRET"])
+
+    # === GIT ===
+    GITHUB_CLIENT_ID: str = empty_str_cast(config_ini["git"].get("GITHUB_CLIENT_ID", "")) if config_ini.has_section("git") else None
+    GITHUB_URL: str = empty_str_cast(config_ini["git"].get("GITHUB_URL", "")) if config_ini.has_section("git") else None
+    GITLAB_CLIENT_ID: str = empty_str_cast(config_ini["git"].get("GITLAB_CLIENT_ID", "")) if config_ini.has_section("git") else None
+    GITLAB_URL: str = empty_str_cast(config_ini["git"].get("GITLAB_URL", "")) if config_ini.has_section("git") else None
+
+    # === MANAGEMENT ===
+    PRESET_ADMIN_NAME: str = empty_str_cast(config_ini["management"].get("PRESET_ADMIN_NAME", "")) if config_ini.has_section("management") else None
+    PRESET_ADMIN_EMAIL: str = empty_str_cast(config_ini["management"].get("PRESET_ADMIN_EMAIL", "")) if config_ini.has_section("management") else None
+    PRESET_ADMIN_PASSWORD: str = empty_str_cast(config_ini["management"].get("PRESET_ADMIN_PASSWORD", "")) if config_ini.has_section("management") else None
+    PRESET_ADMIN_TOKEN: str = empty_str_cast(config_ini["management"].get("PRESET_ADMIN_TOKEN", "")) if config_ini.has_section("management") else None
+    PRESET_CONFIGS: str = empty_str_cast(config_ini["management"].get("PRESET_CONFIGS", "")) if config_ini.has_section("management") else None
+    if PRESET_CONFIGS and SAFE_MODE is False:
+        try:
+            PRESET_CONFIGS = json.loads(PRESET_CONFIGS)
+        except (ValueError, TypeError):
+            print("Exception occurred during PRESET_CONFIGS loading")
+            PRESET_CONFIGS = {}
+    else:
+        PRESET_CONFIGS = {}
+
+    # === EXTRA ===
+    # Since the configurations in section "[extra]" will be loaded later, it is not necessary to declare them here.
+    # However, if you want to have some processing or checking on the value, you can still declare it here just like other configurations.
 # fmt: on
 
 
@@ -225,4 +358,10 @@ class TestingConfig(ServerConfig):
 # Actually initialize ServerConfig to allow us to add more attributes on
 Config = ServerConfig()
 for k, v in config_ini.items("extra"):
-    setattr(Config, k, process_string_var(v))
+    # We should only add the values that are not yet loaded in ServerConfig.
+    if hasattr(Config, k):
+        raise ValueError(
+            f"Built-in Config {k} should not be defined in the [extra] section of config.ini"
+        )
+
+    setattr(Config, k, v)

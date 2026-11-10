@@ -1,9 +1,12 @@
-import csv
+import csv  # noqa: I001
 import datetime
 import os
 from io import StringIO
 
-from flask import Blueprint, abort
+from flask import (
+    Blueprint,
+    abort,
+)
 from flask import current_app as app
 from flask import (
     jsonify,
@@ -18,15 +21,26 @@ from flask import (
 admin = Blueprint("admin", __name__)
 
 # isort:imports-firstparty
-from CTFd.admin import challenges  # noqa: F401
-from CTFd.admin import notifications  # noqa: F401
-from CTFd.admin import pages  # noqa: F401
-from CTFd.admin import scoreboard  # noqa: F401
-from CTFd.admin import statistics  # noqa: F401
-from CTFd.admin import submissions  # noqa: F401
-from CTFd.admin import teams  # noqa: F401
-from CTFd.admin import users  # noqa: F401
-from CTFd.cache import cache, clear_config, clear_pages, clear_standings
+from CTFd.admin import audiences  # noqa: F401,I001
+from CTFd.admin import challenges  # noqa: F401,I001
+from CTFd.admin import modules  # noqa: F401,I001
+from CTFd.admin import notifications  # noqa: F401,I001
+from CTFd.admin import pages  # noqa: F401,I001
+from CTFd.admin import scoreboard  # noqa: F401,I001
+from CTFd.admin import statistics  # noqa: F401,I001
+from CTFd.admin import submissions  # noqa: F401,I001
+from CTFd.admin import teams  # noqa: F401,I001
+from CTFd.admin import users  # noqa: F401,I001
+from CTFd.cache import (
+    cache,
+    clear_all_team_sessions,
+    clear_all_user_sessions,
+    clear_challenges,
+    clear_config,
+    clear_pages,
+    clear_standings,
+)
+from CTFd.constants.setup import DEFAULTS
 from CTFd.models import (
     Awards,
     Challenges,
@@ -42,12 +56,17 @@ from CTFd.models import (
     db,
 )
 from CTFd.utils import config as ctf_config
-from CTFd.utils import get_config, set_config
-from CTFd.utils.csv import dump_csv, load_challenges_csv, load_teams_csv, load_users_csv
+from CTFd.utils import get_app_config, get_config, set_config
+from CTFd.utils.csv import (
+    dump_csv,
+    load_challenges_csv,
+    load_teams_csv,
+    load_users_csv,
+    load_users_teams_csv,
+)
 from CTFd.utils.decorators import admins_only
+from CTFd.utils.exports import background_import_ctf
 from CTFd.utils.exports import export_ctf as export_ctf_util
-from CTFd.utils.exports import import_ctf as import_ctf_util
-from CTFd.utils.helpers import get_errors
 from CTFd.utils.security.auth import logout_user
 from CTFd.utils.uploads import delete_file
 from CTFd.utils.user import is_admin
@@ -88,21 +107,25 @@ def plugin(plugin):
         return "1"
 
 
-@admin.route("/admin/import", methods=["POST"])
+@admin.route("/admin/import", methods=["GET", "POST"])
 @admins_only
 def import_ctf():
-    backup = request.files["backup"]
-    errors = get_errors()
-    try:
-        import_ctf_util(backup)
-    except Exception as e:
-        print(e)
-        errors.append(repr(e))
-
-    if errors:
-        return errors[0], 500
-    else:
-        return redirect(url_for("admin.config"))
+    if request.method == "GET":
+        start_time = cache.get("import_start_time")
+        end_time = cache.get("import_end_time")
+        import_status = cache.get("import_status")
+        import_error = cache.get("import_error")
+        return render_template(
+            "admin/import.html",
+            start_time=start_time,
+            end_time=end_time,
+            import_status=import_status,
+            import_error=import_error,
+        )
+    elif request.method == "POST":
+        backup = request.files["backup"]
+        background_import_ctf(backup)
+        return redirect(url_for("admin.import_ctf"))
 
 
 @admin.route("/admin/export", methods=["GET", "POST"])
@@ -111,7 +134,7 @@ def export_ctf():
     backup = export_ctf_util()
     ctf_name = ctf_config.ctf_name()
     day = datetime.datetime.now().strftime("%Y-%m-%d_%T")
-    full_name = u"{}.{}.zip".format(ctf_name, day)
+    full_name = "{}.{}.zip".format(ctf_name, day)
     return send_file(
         backup, cache_timeout=-1, as_attachment=True, attachment_filename=full_name
     )
@@ -136,6 +159,7 @@ def import_csv():
         "challenges": load_challenges_csv,
         "users": load_users_csv,
         "teams": load_teams_csv,
+        "users+teams": load_users_teams_csv,
     }
 
     loader = loaders[csv_type]
@@ -157,8 +181,8 @@ def export_csv():
     return send_file(
         output,
         as_attachment=True,
-        cache_timeout=-1,
-        attachment_filename="{name}-{table}.csv".format(
+        max_age=-1,
+        download_name="{name}-{table}.csv".format(
             name=ctf_config.ctf_name(), table=table
         ),
     )
@@ -173,10 +197,27 @@ def config():
     configs = Configs.query.all()
     configs = {c.key: get_config(c.key) for c in configs}
 
-    themes = ctf_config.get_themes()
-    themes.remove(get_config("ctf_theme"))
+    # Load in defaults that would normally exist on UI setup
+    for k, v in DEFAULTS.items():
+        if k not in configs:
+            configs[k] = v
 
-    return render_template("admin/config.html", themes=themes, **configs)
+    themes = ctf_config.get_themes()
+
+    # Remove current theme but ignore failure
+    try:
+        themes.remove(get_config("ctf_theme"))
+    except ValueError:
+        pass
+
+    force_html_sanitization = get_app_config("HTML_SANITIZATION")
+
+    return render_template(
+        "admin/config.html",
+        themes=themes,
+        **configs,
+        force_html_sanitization=force_html_sanitization,
+    )
 
 
 @admin.route("/admin/reset", methods=["GET", "POST"])
@@ -220,6 +261,13 @@ def reset():
             Unlocks.query.delete()
             Tracking.query.delete()
 
+        if data.get("user_mode") == "users":
+            db.session.query(Users).update({Users.team_id: None})
+            Teams.query.delete()
+
+            clear_all_user_sessions()
+            clear_all_team_sessions()
+
         if require_setup:
             set_config("setup", False)
             cache.clear()
@@ -230,6 +278,7 @@ def reset():
 
         clear_pages()
         clear_standings()
+        clear_challenges()
         clear_config()
 
         if logout is True:

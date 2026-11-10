@@ -16,7 +16,9 @@ class PageSchema(ma.ModelSchema):
         "title",
         validate=[
             validate.Length(
-                min=0, max=80, error="Page could not be saved. Your title is too long.",
+                min=0,
+                max=80,
+                error="Page could not be saved. Your title is too long.",
             )
         ],
     )
@@ -47,6 +49,18 @@ class PageSchema(ma.ModelSchema):
         ],
     )
 
+    link_target = field_for(
+        Pages,
+        "link_target",
+        allow_none=True,
+        validate=[
+            validate.OneOf(
+                choices=[None, "_self", "_blank"],
+                error="Invalid link target",
+            )
+        ],
+    )
+
     @pre_load
     def validate_route(self, data):
         route = data.get("route")
@@ -58,6 +72,10 @@ class PageSchema(ma.ModelSchema):
             if isinstance(view, string_types):
                 kwargs["only"] = self.views[view]
             elif isinstance(view, list):
+                # TODO: CTFd 4.0 Passing a list of fields to PageSchema as the view will be removed
+                print(
+                    "Passing a list of fields to PageSchema will be removed in CTFd 4.0. Please pass a view name instead."
+                )
                 kwargs["only"] = view
 
         super(PageSchema, self).__init__(*args, **kwargs)

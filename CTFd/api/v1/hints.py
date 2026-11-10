@@ -1,6 +1,6 @@
 from typing import List
 
-from flask import request
+from flask import abort, request
 from flask_restx import Namespace, Resource
 
 from CTFd.api.v1.helpers.request import validate_args
@@ -9,8 +9,11 @@ from CTFd.api.v1.schemas import APIDetailedSuccessResponse, APIListSuccessRespon
 from CTFd.constants import RawEnum
 from CTFd.models import Hints, HintUnlocks, db
 from CTFd.schemas.hints import HintSchema
-from CTFd.utils.decorators import admins_only, authed_only, during_ctf_time_only
+from CTFd.utils import get_config
+from CTFd.utils.decorators import admins_only, during_ctf_time_only
+from CTFd.utils.decorators.visibility import check_challenge_visibility
 from CTFd.utils.helpers.models import build_model_filters
+from CTFd.utils.modules import can_access_challenge
 from CTFd.utils.user import get_current_user, is_admin
 
 hints_namespace = Namespace("hints", description="Endpoint to retrieve Hints")
@@ -105,7 +108,7 @@ class HintList(Resource):
 @hints_namespace.route("/<hint_id>")
 class Hint(Resource):
     @during_ctf_time_only
-    @authed_only
+    @check_challenge_visibility
     @hints_namespace.doc(
         description="Endpoint to get a specific Hint object",
         responses={
@@ -117,17 +120,77 @@ class Hint(Resource):
         },
     )
     def get(self, hint_id):
-        user = get_current_user()
         hint = Hints.query.filter_by(id=hint_id).first_or_404()
+        # If the user isn't an admin we should respect the challenge visibility
+        if is_admin() is False:
+            if hint.challenge.state == "hidden":
+                abort(404)
 
-        view = "unlocked"
-        if hint.cost:
-            view = "locked"
-            unlocked = HintUnlocks.query.filter_by(
-                account_id=user.account_id, target=hint.id
-            ).first()
-            if unlocked:
-                view = "unlocked"
+        user = get_current_user()
+        if is_admin() is False and not can_access_challenge(hint.challenge, user):
+            abort(404)
+
+        # We allow public accessing of hints if challenges are visible and there is no cost or prerequisites
+        # If there is a cost or a prereq we should block the user from seeing the hint
+        if user is None:
+            if hint.cost or hint.prerequisites:
+                return (
+                    {
+                        "success": False,
+                        "errors": {"cost": ["You must login to unlock this hint"]},
+                    },
+                    403,
+                )
+            else:
+                # Allow admins to allow public CTFs to see free hints if they wish
+                if bool(get_config("hints_free_public_access", False)) is True:
+                    response = HintSchema(view="unlocked").dump(hint)
+                    return {"success": True, "data": response.data}
+                else:
+                    return (
+                        {
+                            "success": False,
+                            "errors": {"cost": ["You must login to unlock this hint"]},
+                        },
+                        403,
+                    )
+
+        if hint.prerequisites:
+            requirements = hint.prerequisites
+
+            # Get the IDs of all hints that the user has unlocked
+            all_unlocks = HintUnlocks.query.filter_by(account_id=user.account_id).all()
+            unlock_ids = {unlock.target for unlock in all_unlocks}
+
+            # Filter out hint IDs that don't exist
+            all_hint_ids = {h.id for h in Hints.query.with_entities(Hints.id).all()}
+            prereqs = set(requirements).intersection(all_hint_ids)
+
+            # If the user has the necessary unlocks or is admin we should allow them to view
+            if unlock_ids >= prereqs:
+                pass
+            else:
+                if is_admin() and request.args.get("preview", False):
+                    pass
+                else:
+                    return (
+                        {
+                            "success": False,
+                            "errors": {
+                                "requirements": [
+                                    "You must unlock other hints before accessing this hint"
+                                ]
+                            },
+                        },
+                        403,
+                    )
+
+        view = "locked"
+        unlocked = HintUnlocks.query.filter_by(
+            account_id=user.account_id, target=hint.id
+        ).first()
+        if unlocked:
+            view = "unlocked"
 
         if is_admin():
             if request.args.get("preview", False):

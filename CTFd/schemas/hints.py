@@ -9,9 +9,10 @@ class HintSchema(ma.ModelSchema):
         dump_only = ("id", "type", "html")
 
     views = {
-        "locked": ["id", "type", "challenge", "challenge_id", "cost"],
+        "locked": ["id", "title", "type", "challenge", "challenge_id", "cost"],
         "unlocked": [
             "id",
+            "title",
             "type",
             "challenge",
             "challenge_id",
@@ -21,6 +22,7 @@ class HintSchema(ma.ModelSchema):
         ],
         "admin": [
             "id",
+            "title",
             "type",
             "challenge",
             "challenge_id",
@@ -36,6 +38,10 @@ class HintSchema(ma.ModelSchema):
             if isinstance(view, string_types):
                 kwargs["only"] = self.views[view]
             elif isinstance(view, list):
+                # TODO: CTFd 4.0 Passing a list of fields to HintSchema as the view will be removed
+                print(
+                    "Passing a list of fields to HintSchema will be removed in CTFd 4.0. Please pass a view name instead."
+                )
                 kwargs["only"] = view
 
         super(HintSchema, self).__init__(*args, **kwargs)

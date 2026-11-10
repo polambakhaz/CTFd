@@ -1,15 +1,23 @@
+PRETTIER := CTFd/themes/admin/node_modules/.bin/prettier
+
 lint:
-	flake8 --ignore=E402,E501,E712,W503,E203 --exclude=CTFd/uploads CTFd/ migrations/ tests/
-	yarn lint
-	black --check --diff --exclude=CTFd/uploads --exclude=node_modules .
-	prettier --check 'CTFd/themes/**/assets/**/*'
-	prettier --check '**/*.md'
+	ruff check CTFd/ migrations/ tests/
+	ruff format --check --diff .
+	yarn --cwd CTFd/themes/admin lint
+	yarn --cwd CTFd/themes/core lint
+	$(PRETTIER) --check '**/*.md'
 
 format:
-	isort --skip=CTFd/uploads -rc CTFd/ tests/
-	black --exclude=CTFd/uploads --exclude=node_modules .
-	prettier --write 'CTFd/themes/**/assets/**/*'
-	prettier --write '**/*.md'
+	ruff check --select I --fix CTFd/ migrations/ tests/
+	ruff format .
+	yarn --cwd CTFd/themes/admin format
+	yarn --cwd CTFd/themes/core format
+	$(PRETTIER) --write '**/*.md'
+
+# requirements.txt is generated from uv.lock for consumers that install with
+# pip. uv.lock is the source of truth - edit pyproject.toml and re-run this.
+requirements:
+	uv export --frozen --no-dev --no-hashes --no-emit-project --output-file requirements.txt
 
 test:
 	pytest -rf --cov=CTFd --cov-context=test --cov-report=xml \
@@ -18,9 +26,6 @@ test:
 		-W ignore::sqlalchemy.exc.SADeprecationWarning \
 		-W ignore::sqlalchemy.exc.SAWarning \
 		-n auto
-	bandit -r CTFd -x CTFd/uploads --skip B105,B322
-	pipdeptree
-	yarn verify
 
 coverage:
 	coverage html --show-contexts
@@ -30,3 +35,19 @@ serve:
 
 shell:
 	python manage.py shell
+
+translations-init:
+	# make translations-init lang=af
+	pybabel init -i messages.pot -d CTFd/translations -l $(lang)
+
+translations-extract:
+	pybabel extract -F babel.cfg -k lazy_gettext -k _l -o messages.pot .
+
+translations-update:
+	pybabel update --ignore-obsolete -i messages.pot -d CTFd/translations
+
+translations-compile:
+	pybabel compile -f -d CTFd/translations
+
+translations-lint:
+	dennis-cmd lint CTFd/translations

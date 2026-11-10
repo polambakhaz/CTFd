@@ -1,11 +1,13 @@
-import datetime
 import time
+from datetime import datetime as DateTime
+from datetime import timezone
+from typing import Union
 
 from CTFd.utils import get_config
 
 
 def ctftime():
-    """ Checks whether it's CTF time or not. """
+    """Checks whether it's CTF time or not."""
 
     start = get_config("start")
     end = get_config("end")
@@ -57,17 +59,44 @@ def view_after_ctf():
     return get_config("view_after_ctf")
 
 
-def unix_time(dt):
-    return int((dt - datetime.datetime(1970, 1, 1)).total_seconds())
+def unix_time(dt: DateTime) -> int:
+    if dt is None or not isinstance(dt, DateTime):
+        print("Invalid datetime object for time filter function.")
+        return None
+    return int((dt - DateTime(1970, 1, 1)).total_seconds())
 
 
-def unix_time_millis(dt):
-    return unix_time(dt) * 1000
+def unix_time_millis(dt: DateTime) -> int:
+    ut = unix_time(dt)
+    if ut is None:
+        return None
+    return ut * 1000
 
 
-def unix_time_to_utc(t):
-    return datetime.datetime.utcfromtimestamp(t)
+def unix_time_to_utc(t: Union[int, float]) -> DateTime:
+    if t is None:
+        print("Invalid datetime object for time filter function.")
+        return None
+    # TODO: The utcfromtimestamp() has been deprecated
+    return DateTime.utcfromtimestamp(t)
 
 
-def isoformat(dt):
+def isoformat(dt: DateTime) -> str:
+    if dt is None or not isinstance(dt, DateTime):
+        print("Invalid datetime object for time filter function.")
+        return None
     return dt.isoformat() + "Z"
+
+
+def parse_iso_datetime(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, DateTime):
+        dt = value
+    else:
+        if isinstance(value, str) and value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = DateTime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt

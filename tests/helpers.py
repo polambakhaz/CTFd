@@ -15,10 +15,14 @@ from sqlalchemy_utils import drop_database
 from werkzeug.datastructures import Headers
 
 from CTFd import create_app
-from CTFd.cache import cache, clear_standings
+from CTFd.cache import cache, clear_challenges, clear_ratings, clear_standings
 from CTFd.config import TestingConfig
+from CTFd.constants.themes import DEFAULT_THEME
 from CTFd.models import (
+    AudienceMembers,
+    Audiences,
     Awards,
+    Brackets,
     ChallengeComments,
     ChallengeFiles,
     Challenges,
@@ -29,10 +33,14 @@ from CTFd.models import (
     Files,
     Flags,
     Hints,
+    ModuleAudienceAccess,
+    Modules,
     Notifications,
     PageComments,
     PageFiles,
     Pages,
+    Ratings,
+    Solutions,
     Solves,
     Tags,
     TeamComments,
@@ -129,16 +137,20 @@ def create_ctfd(
     enable_plugins=False,
     application_root="/",
     config=TestingConfig,
+    ctf_theme=None,
 ):
     if enable_plugins:
         config.SAFE_MODE = False
     else:
         config.SAFE_MODE = True
 
+    if ctf_theme is None:
+        ctf_theme = DEFAULT_THEME
+
     config.APPLICATION_ROOT = application_root
     url = make_url(config.SQLALCHEMY_DATABASE_URI)
     if url.database:
-        url.database = str(uuid.uuid4())
+        url = url.set(database=str(uuid.uuid4()))
     config.SQLALCHEMY_DATABASE_URI = str(url)
 
     app = create_app(config)
@@ -153,6 +165,7 @@ def create_ctfd(
             email=email,
             password=password,
             user_mode=user_mode,
+            ctf_theme=ctf_theme,
         )
     return app
 
@@ -165,7 +178,10 @@ def setup_ctfd(
     email="admin@examplectf.com",
     password="password",
     user_mode="users",
+    ctf_theme=None,
 ):
+    if ctf_theme is None:
+        ctf_theme = DEFAULT_THEME
     with app.app_context():
         with app.test_client() as client:
             client.get("/setup")  # Populate session with nonce
@@ -178,6 +194,7 @@ def setup_ctfd(
                     "password": password,
                     "user_mode": user_mode,
                     "nonce": sess.get("nonce"),
+                    "ctf_theme": ctf_theme,
                 }
             client.post("/setup", data=data)
     return app
@@ -195,6 +212,7 @@ def register_user(
     name="user",
     email="user@examplectf.com",
     password="password",
+    bracket_id=None,
     raise_for_error=True,
 ):
     with app.app_context():
@@ -207,6 +225,8 @@ def register_user(
                     "password": password,
                     "nonce": sess.get("nonce"),
                 }
+            if bracket_id:
+                data["bracket_id"] = bracket_id
             client.post("/register", data=data)
             if raise_for_error:
                 with client.session_transaction() as sess:
@@ -252,9 +272,11 @@ def login_with_mlc(
     team_oauth_id=1234,
     raise_for_error=True,
 ):
-    with app.test_client() as client, patch.object(
-        requests, "get"
-    ) as fake_get_request, patch.object(requests, "post") as fake_post_request:
+    with (
+        app.test_client() as client,
+        patch.object(requests, "get") as fake_get_request,
+        patch.object(requests, "post") as fake_post_request,
+    ):
         client.get("/login")
         with client.session_transaction() as sess:
             nonce = sess["nonce"]
@@ -323,7 +345,7 @@ def gen_challenge(
     category="chal_category",
     type="standard",
     state="visible",
-    **kwargs
+    **kwargs,
 ):
     chal = Challenges(
         name=name,
@@ -332,10 +354,11 @@ def gen_challenge(
         category=category,
         type=type,
         state=state,
-        **kwargs
+        **kwargs,
     )
     db.session.add(chal)
     db.session.commit()
+    clear_challenges()
     return chal
 
 
@@ -402,7 +425,7 @@ def gen_team(
     email="team@examplectf.com",
     password="password",
     member_count=4,
-    **kwargs
+    **kwargs,
 ):
     team = Teams(name=name, email=email, password=password, **kwargs)
     for i in range(member_count):
@@ -441,7 +464,7 @@ def gen_solve(
     challenge_id=None,
     ip="127.0.0.1",
     provided="rightkey",
-    **kwargs
+    **kwargs,
 ):
     solve = Solves(
         user_id=user_id,
@@ -449,13 +472,24 @@ def gen_solve(
         challenge_id=challenge_id,
         ip=ip,
         provided=provided,
-        **kwargs
+        **kwargs,
     )
     solve.date = datetime.datetime.utcnow()
     db.session.add(solve)
     db.session.commit()
     clear_standings()
+    clear_challenges()
     return solve
+
+
+def gen_rating(db, user_id, challenge_id, value=1, review="Great challenge!", **kwargs):
+    rating = Ratings(
+        user_id=user_id, challenge_id=challenge_id, value=value, review=review, **kwargs
+    )
+    db.session.add(rating)
+    db.session.commit()
+    clear_ratings()
+    return rating
 
 
 def gen_fail(
@@ -465,7 +499,7 @@ def gen_fail(
     challenge_id=None,
     ip="127.0.0.1",
     provided="wrongkey",
-    **kwargs
+    **kwargs,
 ):
     fail = Fails(
         user_id=user_id,
@@ -473,7 +507,7 @@ def gen_fail(
         challenge_id=challenge_id,
         ip=ip,
         provided=provided,
-        **kwargs
+        **kwargs,
     )
     fail.date = datetime.datetime.utcnow()
     db.session.add(fail)
@@ -481,8 +515,14 @@ def gen_fail(
     return fail
 
 
-def gen_tracking(db, user_id=None, ip="127.0.0.1", **kwargs):
-    tracking = Tracking(ip=ip, user_id=user_id, **kwargs)
+def gen_tracking(
+    db,
+    user_id=None,
+    ip="127.0.0.1",
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    **kwargs,
+):
+    tracking = Tracking(ip=ip, user_agent=user_agent, user_id=user_id, **kwargs)
     db.session.add(tracking)
     db.session.commit()
     return tracking
@@ -495,7 +535,7 @@ def gen_page(db, title, route, content, draft=False, auth_required=False, **kwar
         content=content,
         draft=draft,
         auth_required=auth_required,
-        **kwargs
+        **kwargs,
     )
     db.session.add(page)
     db.session.commit()
@@ -533,6 +573,16 @@ def gen_comment(db, content="comment", author_id=None, type="challenge", **kwarg
     return comment
 
 
+def gen_solution(db, challenge_id, content="test solution", state="hidden", **kwargs):
+    """Helper function to generate a solution"""
+    solution = Solutions(
+        challenge_id=challenge_id, content=content, state=state, **kwargs
+    )
+    db.session.add(solution)
+    db.session.commit()
+    return solution
+
+
 def gen_field(
     db,
     name="CustomField",
@@ -555,6 +605,49 @@ def gen_field(
     db.session.add(field)
     db.session.commit()
     return field
+
+
+def gen_bracket(
+    db,
+    name="players",
+    description="players who are part of the test",
+    type="users",
+):
+    bracket = Brackets(
+        name=name,
+        description=description,
+        type=type,
+    )
+    db.session.add(bracket)
+    db.session.commit()
+
+
+def gen_audience(db, name="audience", description=None):
+    audience = Audiences(name=name, description=description)
+    db.session.add(audience)
+    db.session.commit()
+    return audience
+
+
+def gen_module(db, name="module", description=None):
+    module = Modules(name=name, description=description)
+    db.session.add(module)
+    db.session.commit()
+    return module
+
+
+def gen_audience_member(db, audience_id, user_id=None, team_id=None):
+    m = AudienceMembers(audience_id=audience_id, user_id=user_id, team_id=team_id)
+    db.session.add(m)
+    db.session.commit()
+    return m
+
+
+def gen_module_audience_access(db, module_id, audience_id):
+    link = ModuleAudienceAccess(module_id=module_id, audience_id=audience_id)
+    db.session.add(link)
+    db.session.commit()
+    return link
 
 
 def simulate_user_activity(db, user):

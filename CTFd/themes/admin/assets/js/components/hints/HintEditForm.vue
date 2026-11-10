@@ -25,7 +25,21 @@
               <div class="row">
                 <div class="col-md-12">
                   <div class="form-group">
-                    <label class="text-muted">
+                    <label>
+                      Title<br />
+                      <small>Content displayed before hint unlocking</small>
+                    </label>
+                    <input
+                      type="text"
+                      class="form-control"
+                      name="title"
+                      :value="this.title"
+                      ref="title"
+                    />
+                  </div>
+
+                  <div class="form-group">
+                    <label>
                       Hint<br />
                       <small>Markdown &amp; HTML are supported</small>
                     </label>
@@ -52,6 +66,31 @@
                       v-model.lazy="cost"
                     />
                   </div>
+
+                  <div class="form-group">
+                    <label>
+                      Requirements<br />
+                      <small
+                        >Hints that must be unlocked before unlocking this
+                        hint</small
+                      >
+                    </label>
+                    <div
+                      class="form-check"
+                      v-for="hint in otherHints"
+                      :key="hint.id"
+                    >
+                      <label class="form-check-label cursor-pointer">
+                        <input
+                          class="form-check-input"
+                          type="checkbox"
+                          :value="hint.id"
+                          v-model="selectedHints"
+                        />
+                        {{ hint.content }} - {{ hint.cost }}
+                      </label>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -72,19 +111,31 @@
 </template>
 
 <script>
-import CTFd from "core/CTFd";
+import CTFd from "../../compat/CTFd";
 import { bindMarkdownEditor } from "../../styles";
 
 export default {
   name: "HintEditForm",
   props: {
-    hint_id: Number
+    challenge_id: Number,
+    hint_id: Number,
+    hints: Array,
   },
-  data: function() {
+  data: function () {
     return {
       cost: 0,
-      content: null
+      title: null,
+      content: null,
+      selectedHints: [],
     };
+  },
+  computed: {
+    // Get all hints besides the current one
+    otherHints: function () {
+      return this.hints.filter((hint) => {
+        return hint.id !== this.$props.hint_id;
+      });
+    },
   },
   watch: {
     hint_id: {
@@ -93,52 +144,63 @@ export default {
         if (val !== null) {
           this.loadHint();
         }
-      }
-    }
+      },
+    },
   },
   methods: {
-    loadHint: function() {
+    loadHint: function () {
       CTFd.fetch(`/api/v1/hints/${this.$props.hint_id}?preview=true`, {
         method: "GET",
         credentials: "same-origin",
         headers: {
           Accept: "application/json",
-          "Content-Type": "application/json"
-        }
+          "Content-Type": "application/json",
+        },
       })
-        .then(response => {
+        .then((response) => {
           return response.json();
         })
-        .then(response => {
+        .then((response) => {
           if (response.success) {
             let hint = response.data;
             this.cost = hint.cost;
+            this.title = hint.title;
             this.content = hint.content;
-            // Wait for Vue to update the DOM
-            this.$nextTick(() => {
-              // Wait a little longer because we need the modal to appear.
-              // Kinda nasty but not really avoidable without polling the DOM via CodeMirror
-              setTimeout(() => {
-                let editor = this.$refs.content;
-                bindMarkdownEditor(editor);
-                editor.mde.codemirror.getDoc().setValue(editor.value);
-                editor.mde.codemirror.refresh();
-              }, 100);
-            });
+            this.selectedHints = hint.requirements?.prerequisites || [];
+            // Wait a little longer because we need the modal to appear.
+            // Kinda nasty but not really avoidable without polling the DOM via CodeMirror
+            let editor = this.$refs.content;
+            bindMarkdownEditor(editor);
+            setTimeout(() => {
+              editor.mde.codemirror.getDoc().setValue(editor.value);
+              this._forceRefresh();
+            }, 200);
           }
         });
     },
-    getCost: function() {
+    _forceRefresh: function () {
+      // Temporary function while we are relying on CodeMirror + MDE
+      let editor = this.$refs.content;
+      editor.mde.codemirror.refresh();
+    },
+    getCost: function () {
       return this.cost || 0;
     },
-    getContent: function() {
-      return this.$refs.content.value;
+    getContent: function () {
+      this._forceRefresh();
+      let editor = this.$refs.content;
+      return editor.mde.codemirror.getDoc().getValue();
     },
-    updateHint: function() {
+    getTitle: function () {
+      return this.$refs.title.value;
+    },
+    updateHint: function () {
       let params = {
         challenge_id: this.$props.challenge_id,
         content: this.getContent(),
-        cost: this.getCost()
+        cost: this.getCost(),
+        title: this.getTitle(),
+        requirements: { prerequisites: this.selectedHints },
       };
 
       CTFd.fetch(`/api/v1/hints/${this.$props.hint_id}`, {
@@ -146,19 +208,19 @@ export default {
         credentials: "same-origin",
         headers: {
           Accept: "application/json",
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
-        body: JSON.stringify(params)
+        body: JSON.stringify(params),
       })
-        .then(response => {
+        .then((response) => {
           return response.json();
         })
-        .then(response => {
+        .then((response) => {
           if (response.success) {
             this.$emit("refreshHints", this.$options.name);
           }
         });
-    }
+    },
   },
   mounted() {
     if (this.hint_id) {
@@ -169,7 +231,7 @@ export default {
     if (this.hint_id) {
       this.loadHint();
     }
-  }
+  },
 };
 </script>
 
